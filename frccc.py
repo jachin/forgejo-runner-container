@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import socket
 import subprocess
@@ -185,6 +186,24 @@ def start_dind_container(
     )
 
 
+def get_container_ip(container_name: str) -> str:
+    proc = run(["container", "list", "--all", "--format", "json"], capture_output=True)
+    try:
+        rows = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise CliError(f"Unable to parse container list JSON: {exc}") from exc
+
+    for row in rows:
+        row_id = row.get("id") or row.get("ID")
+        if row_id == container_name:
+            addr = row.get("addr") or row.get("ADDR") or ""
+            if not addr:
+                raise CliError(f"Container {container_name} has no IP address yet")
+            return str(addr).split("/")[0]
+
+    raise CliError(f"Container {container_name} not found in container list")
+
+
 def start_runner_container(
     *,
     runner_image: str,
@@ -280,7 +299,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             dind_port=args.dind_port,
             timeout_seconds=args.dind_wait_timeout,
         )
-        docker_host = args.dind_host or f"{args.dind_name}.test"
+        docker_host = args.dind_host or get_container_ip(args.dind_name)
     else:
         docker_host = None
 
