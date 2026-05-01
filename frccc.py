@@ -5,11 +5,16 @@ import argparse
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 DEFAULT_NETWORK = "forgejo-net"
 DEFAULT_RUNNER_NAME = "forgejo-runner"
+DEFAULT_DIND_NAME = "docker-dind"
+DEFAULT_DIND_VOLUME = "forgejo-dind-data"
+DEFAULT_DIND_PORT = 2375
 DEFAULT_BASE_IMAGE = "data.forgejo.org/forgejo/runner:12"
+DEFAULT_DOCKER_RUNNER_IMAGE = "local/forgejo-runner-docker:12"
 
 
 class CliError(RuntimeError):
@@ -48,6 +53,15 @@ def ensure_network_exists(network_name: str) -> None:
     exists = f'"{network_name}"' in raw
     if not exists:
         run(["container", "network", "create", network_name])
+
+
+def ensure_volume_exists(volume_name: str) -> None:
+    proc = run(["container", "volume", "list", "--format", "json"], capture_output=True)
+    raw = proc.stdout
+
+    exists = f'"{volume_name}"' in raw
+    if not exists:
+        run(["container", "volume", "create", volume_name])
 
 
 def ensure_runner_config(base_image: str, runner_config: Path) -> None:
@@ -111,17 +125,51 @@ def register_runner_non_interactive(
     )
 
 
-def start_runner_container(
+def wait_for_dind(
     *,
-    base_image: str,
     network_name: str,
-    runner_name: str,
-    runner_config: Path,
+    dind_name: str,
+    timeout_seconds: int,
 ) -> None:
-    run(["container", "delete", "-f", runner_name], check=False)
+    print(f"Waiting for Docker daemon in {dind_name} (timeout: {timeout_seconds}s)...")
+    deadline = time.monotonic() + timeout_seconds
 
-    config_dir = runner_config.parent.resolve()
-    config_name = runner_config.name
+    while time.monotonic() < deadline:
+        proc = run(
+            [
+                "container",
+                "run",
+                "--rm",
+                "--network",
+                network_name,
+                "docker:cli",
+                "-H",
+                f"tcp://{dind_name}.test:2375",
+                "info",
+            ],
+            check=False,
+            capture_output=True,
+        )
+        if proc.returncode == 0:
+            print("Docker daemon is reachable.")
+            return
+
+        time.sleep(2)
+
+    raise CliError(
+        "Timed out waiting for docker:dind to become ready. "
+        "Check logs with: container logs -n 200 docker-dind"
+    )
+
+
+def start_dind_container(
+    *,
+    dind_name: str,
+    network_name: str,
+    dind_volume: str,
+    dind_port: int,
+) -> None:
+    run(["container", "delete", "-f", dind_name], check=False)
 
     run(
         [
@@ -129,18 +177,71 @@ def start_runner_container(
             "run",
             "-d",
             "--name",
-            runner_name,
+            dind_name,
             "--network",
             network_name,
+            "--cap-add",
+            "ALL",
             "-v",
-            f"{config_dir}:/data",
-            base_image,
+            f"{dind_volume}:/var/lib/docker",
+            "-p",
+            f"127.0.0.1:{dind_port}:2375",
+            "docker:dind",
+            "dockerd",
+            "-H",
+            "tcp://0.0.0.0:2375",
+            "--tls=false",
+        ]
+    )
+
+
+def start_runner_container(
+    *,
+    runner_image: str,
+    network_name: str,
+    runner_name: str,
+    runner_config: Path,
+    dind_name: str | None,
+) -> None:
+    run(["container", "delete", "-f", runner_name], check=False)
+
+    config_dir = runner_config.parent.resolve()
+    config_name = runner_config.name
+
+    cmd = [
+        "container",
+        "run",
+        "-d",
+        "--name",
+        runner_name,
+        "--network",
+        network_name,
+        "-v",
+        f"{config_dir}:/data",
+    ]
+
+    if dind_name:
+        cmd.extend(["-e", f"DOCKER_HOST=tcp://{dind_name}.test:2375"])
+
+    cmd.extend(
+        [
+            runner_image,
             "forgejo-runner",
             "daemon",
             "--config",
             f"/data/{config_name}",
         ]
     )
+
+    run(cmd)
+
+
+def resolve_runner_image(args: argparse.Namespace) -> str:
+    if args.runner_image:
+        return args.runner_image
+    if args.with_docker:
+        return DEFAULT_DOCKER_RUNNER_IMAGE
+    return args.base_image
 
 
 def cmd_start(args: argparse.Namespace) -> int:
@@ -174,14 +275,39 @@ def cmd_start(args: argparse.Namespace) -> int:
             "You can still start the container, but jobs will not be picked up until registered."
         )
 
+    runner_image = resolve_runner_image(args)
+
+    if args.with_docker:
+        ensure_volume_exists(args.dind_volume)
+        start_dind_container(
+            dind_name=args.dind_name,
+            network_name=args.network_name,
+            dind_volume=args.dind_volume,
+            dind_port=args.dind_port,
+        )
+        wait_for_dind(
+            network_name=args.network_name,
+            dind_name=args.dind_name,
+            timeout_seconds=args.dind_wait_timeout,
+        )
+        dind_name = args.dind_name
+    else:
+        dind_name = None
+
     start_runner_container(
-        base_image=args.base_image,
+        runner_image=runner_image,
         network_name=args.network_name,
         runner_name=args.runner_name,
         runner_config=runner_config,
+        dind_name=dind_name,
     )
 
-    print("Runner started. Use `./frccc.py logs` to follow output.")
+    print("Runner started.")
+    if args.with_docker:
+        print(
+            f"Docker sidecar started: {args.dind_name} on tcp://127.0.0.1:{args.dind_port}"
+        )
+    print("Use `./frccc.py logs -f` to follow runner logs.")
     return 0
 
 
@@ -196,11 +322,27 @@ def cmd_logs(args: argparse.Namespace) -> int:
     ensure_container_binary()
     ensure_container_system_started()
 
-    cmd = ["container", "logs"]
-    if args.follow:
-        cmd.append("-f")
-    cmd.append(args.runner_name)
-    run(cmd)
+    targets: list[str]
+    if args.target == "both":
+        targets = [args.runner_name, args.dind_name]
+    elif args.target == "dind":
+        targets = [args.dind_name]
+    else:
+        targets = [args.runner_name]
+
+    for idx, target in enumerate(targets):
+        if len(targets) > 1:
+            print(f"\n===== logs: {target} =====")
+        cmd = ["container", "logs"]
+        if args.follow:
+            cmd.append("-f")
+        if args.lines is not None:
+            cmd.extend(["-n", str(args.lines)])
+        cmd.append(target)
+        run(cmd)
+        if args.follow and idx < len(targets) - 1:
+            break
+
     return 0
 
 
@@ -209,7 +351,16 @@ def cmd_stop(args: argparse.Namespace) -> int:
     ensure_container_system_started()
 
     run(["container", "stop", args.runner_name], check=False)
-    print("Runner stopped.")
+    run(["container", "stop", args.dind_name], check=False)
+    print("Stopped runner and docker sidecar (if running).")
+    return 0
+
+
+def cmd_build_runner_image(args: argparse.Namespace) -> int:
+    ensure_container_binary()
+    ensure_container_system_started()
+    run(["container", "build", "-t", args.tag, "."])
+    print(f"Built image: {args.tag}")
     return 0
 
 
@@ -232,22 +383,55 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to runner config file (default: <runner-data-dir>/runner-config.yml)",
     )
     start.add_argument("--base-image", default=DEFAULT_BASE_IMAGE)
+    start.add_argument(
+        "--runner-image",
+        default=None,
+        help=(
+            "Runner image used for daemon. "
+            "Default is base image without --with-docker, "
+            "or local/forgejo-runner-docker:12 with --with-docker."
+        ),
+    )
     start.add_argument("--runner-labels", default="container,macos")
     start.add_argument("--forgejo-url", default=None)
     start.add_argument("--runner-token", default=None)
+    start.add_argument(
+        "--with-docker",
+        action="store_true",
+        help="Start docker:dind sidecar and connect runner to it via DOCKER_HOST",
+    )
+    start.add_argument("--dind-name", default=DEFAULT_DIND_NAME)
+    start.add_argument("--dind-volume", default=DEFAULT_DIND_VOLUME)
+    start.add_argument("--dind-port", type=int, default=DEFAULT_DIND_PORT)
+    start.add_argument("--dind-wait-timeout", type=int, default=60)
     start.set_defaults(func=cmd_start)
 
     status = sub.add_parser("status", help="Show container status")
     status.set_defaults(func=cmd_status)
 
-    logs = sub.add_parser("logs", help="Show runner logs")
+    logs = sub.add_parser("logs", help="Show logs")
     logs.add_argument("--runner-name", default=DEFAULT_RUNNER_NAME)
+    logs.add_argument("--dind-name", default=DEFAULT_DIND_NAME)
+    logs.add_argument(
+        "--target",
+        choices=["runner", "dind", "both"],
+        default="runner",
+        help="Which logs to show",
+    )
+    logs.add_argument("-n", "--lines", type=int, default=100)
     logs.add_argument("-f", "--follow", action="store_true")
     logs.set_defaults(func=cmd_logs)
 
-    stop = sub.add_parser("stop", help="Stop runner container")
+    stop = sub.add_parser("stop", help="Stop runner and docker sidecar")
     stop.add_argument("--runner-name", default=DEFAULT_RUNNER_NAME)
+    stop.add_argument("--dind-name", default=DEFAULT_DIND_NAME)
     stop.set_defaults(func=cmd_stop)
+
+    build = sub.add_parser(
+        "build-runner-image", help="Build docker-enabled runner image"
+    )
+    build.add_argument("--tag", default=DEFAULT_DOCKER_RUNNER_IMAGE)
+    build.set_defaults(func=cmd_build_runner_image)
 
     return parser
 
