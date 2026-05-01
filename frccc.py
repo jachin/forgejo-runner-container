@@ -211,35 +211,24 @@ def start_dind_container(
 
 
 def get_container_ip(container_name: str) -> str:
-    proc = run(["container", "list", "--all", "--format", "json"], capture_output=True)
+    proc = run(["container", "inspect", container_name], capture_output=True)
     try:
-        rows = json.loads(proc.stdout)
+        payload = json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
-        raise CliError(f"Unable to parse container list JSON: {exc}") from exc
+        raise CliError(f"Unable to parse container inspect JSON: {exc}") from exc
 
-    if not isinstance(rows, list):
-        raise CliError("Unexpected JSON shape from `container list --format json`")
+    if not isinstance(payload, list) or not payload:
+        raise CliError(f"Unexpected inspect output for {container_name}")
 
-    for row in rows:
-        row_id = row.get("id") or row.get("ID")
-        row_name = row.get("name") or row.get("Name")
-        if row_id == container_name or row_name == container_name:
-            addr = row.get("addr") or row.get("ADDR") or ""
-            if not addr:
-                raise CliError(
-                    f"Container {container_name} found but has no IP address yet; "
-                    "is it running?"
-                )
+    details = payload[0]
+    networks = details.get("networks") or []
+    for net in networks:
+        addr = net.get("address") or net.get("addr") or ""
+        if addr:
             return str(addr).split("/")[0]
 
-    known = []
-    for row in rows:
-        candidate = row.get("name") or row.get("Name") or row.get("id") or row.get("ID")
-        if candidate:
-            known.append(str(candidate))
     raise CliError(
-        f"Container {container_name} not found in container list. "
-        f"Known containers: {', '.join(known)}"
+        f"Container {container_name} has no network address in inspect output"
     )
 
 
@@ -342,10 +331,11 @@ def cmd_start(args: argparse.Namespace) -> int:
             docker_host = args.dind_host
         else:
             candidates = []
+            ip_lookup_error: CliError | None = None
             try:
                 candidates.append(get_container_ip(args.dind_name))
-            except CliError:
-                pass
+            except CliError as exc:
+                ip_lookup_error = exc
             candidates.extend([args.dind_name, f"{args.dind_name}.test"])
 
             docker_host = None
@@ -358,9 +348,12 @@ def cmd_start(args: argparse.Namespace) -> int:
                     break
 
             if docker_host is None:
+                detail = (
+                    f" IP lookup detail: {ip_lookup_error}" if ip_lookup_error else ""
+                )
                 raise CliError(
                     "Unable to find a reachable Docker host from runner network. "
-                    "Try --dind-host with a known-good value."
+                    "Try --dind-host with a known-good value." + detail
                 )
     else:
         docker_host = None
