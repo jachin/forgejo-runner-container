@@ -257,12 +257,12 @@ def get_container_ip(
 
         for net in networks:
             net_id = net.get("network") or net.get("id")
-            addr = net.get("address") or net.get("addr") or ""
+            addr = net.get("address") or net.get("addr") or net.get("ipv4Address") or ""
             if net_id == network_name and addr:
                 return str(addr).split("/")[0]
 
         for net in networks:
-            addr = net.get("address") or net.get("addr") or ""
+            addr = net.get("address") or net.get("addr") or net.get("ipv4Address") or ""
             if addr:
                 return str(addr).split("/")[0]
 
