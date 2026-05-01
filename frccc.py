@@ -280,7 +280,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             dind_port=args.dind_port,
             timeout_seconds=args.dind_wait_timeout,
         )
-        docker_host = args.dind_host or args.dind_name
+        docker_host = args.dind_host or f"{args.dind_name}.test"
     else:
         docker_host = None
 
@@ -394,7 +394,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument(
         "--dind-host",
         default=None,
-        help="Host/IP for runner to reach Docker daemon (default: --dind-name)",
+        help="Host/IP for runner to reach Docker daemon (default: <dind-name>.test)",
     )
     start.add_argument("--dind-volume", default=DEFAULT_DIND_VOLUME)
     start.add_argument("--dind-port", type=int, default=DEFAULT_DIND_PORT)
