@@ -153,30 +153,6 @@ def wait_for_dind(
     )
 
 
-def probe_docker_endpoint(
-    *,
-    network_name: str,
-    host: str,
-    timeout_seconds: int = 4,
-) -> bool:
-    proc = run(
-        [
-            "container",
-            "run",
-            "--rm",
-            "--network",
-            network_name,
-            "local/forgejo-runner-docker:12",
-            "sh",
-            "-lc",
-            f"DOCKER_HOST=tcp://{host}:2375 docker info >/dev/null 2>&1",
-        ],
-        check=False,
-        capture_output=True,
-    )
-    return proc.returncode == 0
-
-
 def start_dind_container(
     *,
     dind_name: str,
@@ -186,31 +162,72 @@ def start_dind_container(
 ) -> None:
     run(["container", "delete", "-f", dind_name], check=False)
 
-    run(
-        [
-            "container",
-            "run",
-            "-d",
-            "--name",
-            dind_name,
-            "--network",
-            network_name,
-            "--cap-add",
-            "ALL",
-            "-v",
-            f"{dind_volume}:/var/lib/docker",
-            "-p",
-            f"127.0.0.1:{dind_port}:2375",
-            "docker:dind",
-            "dockerd",
-            "-H",
-            "tcp://0.0.0.0:2375",
-            "--tls=false",
-        ]
+    base_cmd = [
+        "container",
+        "run",
+        "-d",
+        "--name",
+        dind_name,
+        "--network",
+        network_name,
+        "-v",
+        f"{dind_volume}:/var/lib/docker",
+        "-p",
+        f"127.0.0.1:{dind_port}:2375",
+        "docker:dind",
+        "dockerd",
+        "-H",
+        "tcp://0.0.0.0:2375",
+        "--tls=false",
+    ]
+
+    cmd_with_caps = [
+        "container",
+        "run",
+        "-d",
+        "--name",
+        dind_name,
+        "--network",
+        network_name,
+        "--cap-add",
+        "ALL",
+        "-v",
+        f"{dind_volume}:/var/lib/docker",
+        "-p",
+        f"127.0.0.1:{dind_port}:2375",
+        "docker:dind",
+        "dockerd",
+        "-H",
+        "tcp://0.0.0.0:2375",
+        "--tls=false",
+    ]
+    proc = run(cmd_with_caps, check=False, capture_output=True)
+    if proc.returncode == 0:
+        return
+
+    combined = f"{proc.stdout}\n{proc.stderr}".lower()
+    if (
+        "unknown option '--cap-add'" in combined
+        or 'unknown option "--cap-add"' in combined
+    ):
+        print(
+            "`container run` does not support --cap-add on this version; retrying without it."
+        )
+        proc2 = run(base_cmd, check=False, capture_output=True)
+        if proc2.returncode == 0:
+            return
+        raise CliError(
+            "Failed to start docker:dind without --cap-add. "
+            f"stdout: {proc2.stdout.strip()} stderr: {proc2.stderr.strip()}"
+        )
+
+    raise CliError(
+        "Failed to start docker:dind. "
+        f"stdout: {proc.stdout.strip()} stderr: {proc.stderr.strip()}"
     )
 
 
-def get_container_ip(container_name: str) -> str:
+def get_container_ip(container_name: str, network_name: str) -> str:
     proc = run(["container", "inspect", container_name], capture_output=True)
     try:
         payload = json.loads(proc.stdout)
@@ -222,6 +239,13 @@ def get_container_ip(container_name: str) -> str:
 
     details = payload[0]
     networks = details.get("networks") or []
+
+    for net in networks:
+        net_id = net.get("network") or net.get("id")
+        addr = net.get("address") or net.get("addr") or ""
+        if net_id == network_name and addr:
+            return str(addr).split("/")[0]
+
     for net in networks:
         addr = net.get("address") or net.get("addr") or ""
         if addr:
@@ -281,6 +305,23 @@ def resolve_runner_image(args: argparse.Namespace) -> str:
     return args.base_image
 
 
+def image_exists_local(reference: str) -> bool:
+    proc = run(["container", "image", "list", "--format", "json"], capture_output=True)
+    try:
+        rows = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return False
+
+    ref_lower = reference.lower()
+    if isinstance(rows, list):
+        for row in rows:
+            for key in ("name", "Name", "reference", "Reference", "id", "ID"):
+                val = row.get(key)
+                if isinstance(val, str) and val.lower() == ref_lower:
+                    return True
+    return False
+
+
 def cmd_start(args: argparse.Namespace) -> int:
     ensure_container_binary()
     ensure_container_system_started()
@@ -314,6 +355,13 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     runner_image = resolve_runner_image(args)
 
+    if args.with_docker and not args.runner_image:
+        if not image_exists_local(runner_image):
+            raise CliError(
+                f"Runner image {runner_image} is not available locally. "
+                "Build it with `./frccc.py build-runner-image` or pass --runner-image."
+            )
+
     if args.with_docker:
         ensure_volume_exists(args.dind_volume)
         start_dind_container(
@@ -330,31 +378,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         if args.dind_host:
             docker_host = args.dind_host
         else:
-            candidates = []
-            ip_lookup_error: CliError | None = None
-            try:
-                candidates.append(get_container_ip(args.dind_name))
-            except CliError as exc:
-                ip_lookup_error = exc
-            candidates.extend([args.dind_name, f"{args.dind_name}.test"])
-
-            docker_host = None
-            for candidate in candidates:
-                if probe_docker_endpoint(
-                    network_name=args.network_name, host=candidate
-                ):
-                    docker_host = candidate
-                    print(f"Selected Docker host for runner: {docker_host}")
-                    break
-
-            if docker_host is None:
-                detail = (
-                    f" IP lookup detail: {ip_lookup_error}" if ip_lookup_error else ""
-                )
-                raise CliError(
-                    "Unable to find a reachable Docker host from runner network. "
-                    "Try --dind-host with a known-good value." + detail
-                )
+            docker_host = get_container_ip(args.dind_name, args.network_name)
+        print(f"Selected Docker host for runner: {docker_host}")
     else:
         docker_host = None
 
@@ -468,7 +493,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument(
         "--dind-host",
         default=None,
-        help="Host/IP for runner to reach Docker daemon (default: <dind-name>.test)",
+        help="Host/IP for runner to reach Docker daemon (default: DinD container IP on selected network)",
     )
     start.add_argument("--dind-volume", default=DEFAULT_DIND_VOLUME)
     start.add_argument("--dind-port", type=int, default=DEFAULT_DIND_PORT)
