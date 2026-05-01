@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -127,37 +128,26 @@ def register_runner_non_interactive(
 
 def wait_for_dind(
     *,
-    network_name: str,
     dind_name: str,
+    dind_port: int,
     timeout_seconds: int,
 ) -> None:
-    print(f"Waiting for Docker daemon in {dind_name} (timeout: {timeout_seconds}s)...")
+    print(
+        f"Waiting for Docker daemon in {dind_name} on 127.0.0.1:{dind_port} "
+        f"(timeout: {timeout_seconds}s)..."
+    )
     deadline = time.monotonic() + timeout_seconds
 
     while time.monotonic() < deadline:
-        proc = run(
-            [
-                "container",
-                "run",
-                "--rm",
-                "--network",
-                network_name,
-                "docker:cli",
-                "-H",
-                f"tcp://{dind_name}.test:2375",
-                "info",
-            ],
-            check=False,
-            capture_output=True,
-        )
-        if proc.returncode == 0:
-            print("Docker daemon is reachable.")
-            return
-
-        time.sleep(2)
+        try:
+            with socket.create_connection(("127.0.0.1", dind_port), timeout=2):
+                print("Docker daemon TCP port is reachable.")
+                return
+        except OSError:
+            time.sleep(1)
 
     raise CliError(
-        "Timed out waiting for docker:dind to become ready. "
+        "Timed out waiting for docker:dind TCP port to become ready. "
         "Check logs with: container logs -n 200 docker-dind"
     )
 
@@ -286,8 +276,8 @@ def cmd_start(args: argparse.Namespace) -> int:
             dind_port=args.dind_port,
         )
         wait_for_dind(
-            network_name=args.network_name,
             dind_name=args.dind_name,
+            dind_port=args.dind_port,
             timeout_seconds=args.dind_wait_timeout,
         )
         dind_name = args.dind_name
