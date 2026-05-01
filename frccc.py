@@ -191,7 +191,7 @@ def start_runner_container(
     network_name: str,
     runner_name: str,
     runner_config: Path,
-    dind_name: str | None,
+    docker_host: str | None,
 ) -> None:
     run(["container", "delete", "-f", runner_name], check=False)
 
@@ -210,8 +210,8 @@ def start_runner_container(
         f"{config_dir}:/data",
     ]
 
-    if dind_name:
-        cmd.extend(["-e", f"DOCKER_HOST=tcp://{dind_name}.test:2375"])
+    if docker_host:
+        cmd.extend(["-e", f"DOCKER_HOST=tcp://{docker_host}:2375"])
 
     cmd.extend(
         [
@@ -280,16 +280,16 @@ def cmd_start(args: argparse.Namespace) -> int:
             dind_port=args.dind_port,
             timeout_seconds=args.dind_wait_timeout,
         )
-        dind_name = args.dind_name
+        docker_host = args.dind_host or args.dind_name
     else:
-        dind_name = None
+        docker_host = None
 
     start_runner_container(
         runner_image=runner_image,
         network_name=args.network_name,
         runner_name=args.runner_name,
         runner_config=runner_config,
-        dind_name=dind_name,
+        docker_host=docker_host,
     )
 
     print("Runner started.")
@@ -391,6 +391,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Start docker:dind sidecar and connect runner to it via DOCKER_HOST",
     )
     start.add_argument("--dind-name", default=DEFAULT_DIND_NAME)
+    start.add_argument(
+        "--dind-host",
+        default=None,
+        help="Host/IP for runner to reach Docker daemon (default: --dind-name)",
+    )
     start.add_argument("--dind-volume", default=DEFAULT_DIND_VOLUME)
     start.add_argument("--dind-port", type=int, default=DEFAULT_DIND_PORT)
     start.add_argument("--dind-wait-timeout", type=int, default=60)
