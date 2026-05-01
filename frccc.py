@@ -153,6 +153,30 @@ def wait_for_dind(
     )
 
 
+def probe_docker_endpoint(
+    *,
+    network_name: str,
+    host: str,
+    timeout_seconds: int = 4,
+) -> bool:
+    proc = run(
+        [
+            "container",
+            "run",
+            "--rm",
+            "--network",
+            network_name,
+            "local/forgejo-runner-docker:12",
+            "sh",
+            "-lc",
+            f"DOCKER_HOST=tcp://{host}:2375 docker info >/dev/null 2>&1",
+        ],
+        check=False,
+        capture_output=True,
+    )
+    return proc.returncode == 0
+
+
 def start_dind_container(
     *,
     dind_name: str,
@@ -193,15 +217,30 @@ def get_container_ip(container_name: str) -> str:
     except json.JSONDecodeError as exc:
         raise CliError(f"Unable to parse container list JSON: {exc}") from exc
 
+    if not isinstance(rows, list):
+        raise CliError("Unexpected JSON shape from `container list --format json`")
+
     for row in rows:
         row_id = row.get("id") or row.get("ID")
-        if row_id == container_name:
+        row_name = row.get("name") or row.get("Name")
+        if row_id == container_name or row_name == container_name:
             addr = row.get("addr") or row.get("ADDR") or ""
             if not addr:
-                raise CliError(f"Container {container_name} has no IP address yet")
+                raise CliError(
+                    f"Container {container_name} found but has no IP address yet; "
+                    "is it running?"
+                )
             return str(addr).split("/")[0]
 
-    raise CliError(f"Container {container_name} not found in container list")
+    known = []
+    for row in rows:
+        candidate = row.get("name") or row.get("Name") or row.get("id") or row.get("ID")
+        if candidate:
+            known.append(str(candidate))
+    raise CliError(
+        f"Container {container_name} not found in container list. "
+        f"Known containers: {', '.join(known)}"
+    )
 
 
 def start_runner_container(
@@ -299,7 +338,30 @@ def cmd_start(args: argparse.Namespace) -> int:
             dind_port=args.dind_port,
             timeout_seconds=args.dind_wait_timeout,
         )
-        docker_host = args.dind_host or get_container_ip(args.dind_name)
+        if args.dind_host:
+            docker_host = args.dind_host
+        else:
+            candidates = []
+            try:
+                candidates.append(get_container_ip(args.dind_name))
+            except CliError:
+                pass
+            candidates.extend([args.dind_name, f"{args.dind_name}.test"])
+
+            docker_host = None
+            for candidate in candidates:
+                if probe_docker_endpoint(
+                    network_name=args.network_name, host=candidate
+                ):
+                    docker_host = candidate
+                    print(f"Selected Docker host for runner: {docker_host}")
+                    break
+
+            if docker_host is None:
+                raise CliError(
+                    "Unable to find a reachable Docker host from runner network. "
+                    "Try --dind-host with a known-good value."
+                )
     else:
         docker_host = None
 
