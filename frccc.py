@@ -227,32 +227,49 @@ def start_dind_container(
     )
 
 
-def get_container_ip(container_name: str, network_name: str) -> str:
-    proc = run(["container", "inspect", container_name], capture_output=True)
-    try:
-        payload = json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:
-        raise CliError(f"Unable to parse container inspect JSON: {exc}") from exc
+def get_container_ip(
+    container_name: str,
+    network_name: str,
+    timeout_seconds: int = 30,
+) -> str:
+    deadline = time.monotonic() + timeout_seconds
 
-    if not isinstance(payload, list) or not payload:
-        raise CliError(f"Unexpected inspect output for {container_name}")
+    while time.monotonic() < deadline:
+        proc = run(
+            ["container", "inspect", container_name], check=False, capture_output=True
+        )
+        if proc.returncode != 0:
+            time.sleep(1)
+            continue
 
-    details = payload[0]
-    networks = details.get("networks") or []
+        try:
+            payload = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            time.sleep(1)
+            continue
 
-    for net in networks:
-        net_id = net.get("network") or net.get("id")
-        addr = net.get("address") or net.get("addr") or ""
-        if net_id == network_name and addr:
-            return str(addr).split("/")[0]
+        if not isinstance(payload, list) or not payload:
+            time.sleep(1)
+            continue
 
-    for net in networks:
-        addr = net.get("address") or net.get("addr") or ""
-        if addr:
-            return str(addr).split("/")[0]
+        details = payload[0]
+        networks = details.get("networks") or []
+
+        for net in networks:
+            net_id = net.get("network") or net.get("id")
+            addr = net.get("address") or net.get("addr") or ""
+            if net_id == network_name and addr:
+                return str(addr).split("/")[0]
+
+        for net in networks:
+            addr = net.get("address") or net.get("addr") or ""
+            if addr:
+                return str(addr).split("/")[0]
+
+        time.sleep(1)
 
     raise CliError(
-        f"Container {container_name} has no network address in inspect output"
+        f"Container {container_name} has no network address after {timeout_seconds}s"
     )
 
 
