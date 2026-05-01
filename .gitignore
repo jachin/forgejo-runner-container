@@ -1,0 +1,15 @@
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+.env/
+
+# Local runtime data
+runner-data/
+
+# macOS
+.DS_Store
