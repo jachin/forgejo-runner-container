@@ -5,8 +5,13 @@ import argparse
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
+import uuid
+from pathlib import Path
 
 DEFAULT_IMAGE_TAG = "local/forgejo-runner-docker:12"
+DEFAULT_TEST_TIMEOUT_SECONDS = 60
 
 
 class CliError(RuntimeError):
@@ -67,14 +72,35 @@ def require_container_service_running() -> None:
         )
 
 
+def builder_status_running(status_text: str) -> bool:
+    text = status_text.strip().lower()
+    if not text:
+        return False
+
+    if "not running" in text:
+        return False
+
+    if "is running" in text:
+        return True
+
+    for line in text.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "buildkit" and "running" in parts:
+            return True
+
+    return False
+
+
 def ensure_builder_ready() -> None:
     print("Running build preflight: checking builder...")
     status_proc = run(
         ["container", "builder", "status"], check=False, capture_output=True
     )
-    status_text = f"{status_proc.stdout}\n{status_proc.stderr}".strip().lower()
+    status_text = f"{status_proc.stdout}\n{status_proc.stderr}"
 
-    if "is running" in status_text:
+    if builder_status_running(status_text):
         print("Builder is already running.")
         return
 
@@ -94,8 +120,8 @@ def ensure_builder_ready() -> None:
     verify_proc = run(
         ["container", "builder", "status"], check=False, capture_output=True
     )
-    verify_text = f"{verify_proc.stdout}\n{verify_proc.stderr}".strip().lower()
-    if "is running" not in verify_text:
+    verify_text = f"{verify_proc.stdout}\n{verify_proc.stderr}"
+    if not builder_status_running(verify_text):
         raise CliError(
             "Builder preflight did not reach a running state. "
             f"status output: {verify_proc.stdout.strip()} {verify_proc.stderr.strip()}"
@@ -122,6 +148,185 @@ def print_status_table(rows: list[tuple[str, str, str]]) -> None:
     print(separator)
     for row in rows:
         print(fmt_row(*row))
+
+
+def build_runner_image(tag: str, *, no_cache: bool = False) -> None:
+    cmd = ["container", "build"]
+    if no_cache:
+        cmd.append("--no-cache")
+    cmd.extend(["-t", tag, "."])
+    run(cmd)
+
+
+def write_test_container_context(target_dir: Path) -> None:
+    dockerfile = target_dir / "Dockerfile"
+    marker = target_dir / "hello.txt"
+
+    dockerfile.write_text(
+        "FROM alpine:3.20\n"
+        "COPY hello.txt /hello.txt\n"
+        "RUN test -f /hello.txt\n"
+        'CMD ["cat", "/hello.txt"]\n'
+    )
+    marker.write_text("hello from frccc test\n")
+
+
+def start_temp_dind(dind_name: str, network_name: str) -> None:
+    base_cmd = [
+        "container",
+        "run",
+        "-d",
+        "--name",
+        dind_name,
+        "--network",
+        network_name,
+        "docker:dind",
+        "dockerd",
+        "-H",
+        "tcp://0.0.0.0:2375",
+        "--tls=false",
+    ]
+
+    cmd_with_caps = [
+        "container",
+        "run",
+        "-d",
+        "--name",
+        dind_name,
+        "--network",
+        network_name,
+        "--cap-add",
+        "ALL",
+        "docker:dind",
+        "dockerd",
+        "-H",
+        "tcp://0.0.0.0:2375",
+        "--tls=false",
+    ]
+
+    proc = run(cmd_with_caps, check=False, capture_output=True)
+    if proc.returncode == 0:
+        return
+
+    combined = f"{proc.stdout}\n{proc.stderr}".lower()
+    if (
+        "unknown option '--cap-add'" in combined
+        or 'unknown option "--cap-add"' in combined
+    ):
+        print("`container run` does not support --cap-add; retrying without it.")
+        proc2 = run(base_cmd, check=False, capture_output=True)
+        if proc2.returncode == 0:
+            return
+        raise CliError(
+            "Failed to start docker:dind without --cap-add. "
+            f"stdout: {proc2.stdout.strip()} stderr: {proc2.stderr.strip()}"
+        )
+
+    raise CliError(
+        "Failed to start docker:dind. "
+        f"stdout: {proc.stdout.strip()} stderr: {proc.stderr.strip()}"
+    )
+
+
+def get_container_ipv4(container_name: str, network_name: str) -> str:
+    proc = run(["container", "inspect", container_name], capture_output=True)
+
+    # Keep parsing defensive because `container inspect` schema may evolve.
+    import json
+
+    payload = json.loads(proc.stdout)
+    if not isinstance(payload, list) or not payload:
+        raise CliError(f"Unexpected inspect output for container {container_name}")
+
+    details = payload[0]
+    networks = details.get("networks") or []
+
+    # Prefer exact network match first.
+    for net in networks:
+        net_id = net.get("network") or net.get("id")
+        address = net.get("address") or net.get("addr") or net.get("ipv4Address")
+        if net_id == network_name and isinstance(address, str) and address:
+            return address.split("/")[0]
+
+    # Fallback: first available IPv4-ish address.
+    for net in networks:
+        address = net.get("address") or net.get("addr") or net.get("ipv4Address")
+        if isinstance(address, str) and address:
+            return address.split("/")[0]
+
+    raise CliError(
+        f"Could not determine IP address for container {container_name} on network {network_name}"
+    )
+
+
+def wait_for_temp_dind(
+    dind_host: str,
+    dind_name: str,
+    network_name: str,
+    timeout_seconds: int,
+) -> None:
+    print(
+        f"Waiting for temp docker:dind to become ready at {dind_host}:2375 (timeout: {timeout_seconds}s)..."
+    )
+    deadline = time.monotonic() + timeout_seconds
+
+    while time.monotonic() < deadline:
+        probe = run(
+            [
+                "container",
+                "run",
+                "--rm",
+                "--network",
+                network_name,
+                "docker:cli",
+                "-H",
+                f"tcp://{dind_host}:2375",
+                "info",
+            ],
+            check=False,
+            capture_output=True,
+        )
+        if probe.returncode == 0:
+            print("Temp docker:dind is ready.")
+            return
+
+        time.sleep(1)
+
+    raise CliError(
+        "Timed out waiting for temporary docker:dind to become ready. "
+        f"Check logs with: container logs -n 200 {dind_name}"
+    )
+
+
+def run_temp_runner_docker_build(
+    *,
+    runner_image: str,
+    network_name: str,
+    dind_host: str,
+    context_dir: Path,
+    test_image_tag: str,
+) -> None:
+    run(
+        [
+            "container",
+            "run",
+            "--rm",
+            "--network",
+            network_name,
+            "-e",
+            f"DOCKER_HOST=tcp://{dind_host}:2375",
+            "-v",
+            f"{context_dir.resolve()}:/workspace",
+            runner_image,
+            "sh",
+            "-lc",
+            (
+                "docker --version && "
+                f"docker build -t {test_image_tag} /workspace && "
+                f"docker image inspect {test_image_tag} >/dev/null"
+            ),
+        ]
+    )
 
 
 def cmd_status(_: argparse.Namespace) -> int:
@@ -186,9 +391,48 @@ def cmd_build(args: argparse.Namespace) -> int:
     require_container_service_running()
     ensure_builder_ready()
 
-    run(["container", "build", "-t", args.tag, "."])
+    build_runner_image(args.tag)
     print(f"Built image: {args.tag}")
     return 0
+
+
+def cmd_test(args: argparse.Namespace) -> int:
+    ensure_container_binary()
+    require_container_service_running()
+    ensure_builder_ready()
+
+    print("Running fresh build for test...")
+    build_runner_image(args.tag, no_cache=True)
+
+    suffix = uuid.uuid4().hex[:8]
+    network_name = f"frccc-test-net-{suffix}"
+    dind_name = f"frccc-test-dind-{suffix}"
+    test_image_tag = f"frccc-test-image:{suffix}"
+
+    print("Preparing temporary test environment...")
+    run(["container", "network", "create", network_name])
+
+    try:
+        start_temp_dind(dind_name, network_name)
+        dind_host = get_container_ipv4(dind_name, network_name)
+        wait_for_temp_dind(dind_host, dind_name, network_name, args.timeout)
+
+        with tempfile.TemporaryDirectory(prefix="frccc-test-") as tmpdir:
+            context_dir = Path(tmpdir)
+            write_test_container_context(context_dir)
+            run_temp_runner_docker_build(
+                runner_image=args.tag,
+                network_name=network_name,
+                dind_host=dind_host,
+                context_dir=context_dir,
+                test_image_tag=test_image_tag,
+            )
+
+        print("Test passed: temporary runner successfully built a Docker image.")
+        return 0
+    finally:
+        run(["container", "delete", "-f", dind_name], check=False)
+        run(["container", "network", "delete", network_name], check=False)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -211,6 +455,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     build.add_argument("--tag", default=DEFAULT_IMAGE_TAG)
     build.set_defaults(func=cmd_build)
+
+    test = sub.add_parser(
+        "test",
+        help="Fresh-build runner image, launch temporary test stack, and verify Docker build",
+    )
+    test.add_argument("--tag", default=DEFAULT_IMAGE_TAG)
+    test.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_TEST_TIMEOUT_SECONDS,
+        help="Seconds to wait for temporary docker:dind to become ready",
+    )
+    test.set_defaults(func=cmd_test)
 
     return parser
 
