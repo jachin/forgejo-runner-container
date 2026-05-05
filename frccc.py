@@ -445,6 +445,32 @@ def validate_runner_config(
     return True, "basic YAML structure parsed", values
 
 
+def container_running_state(container_name: str) -> tuple[bool, str]:
+    proc = run(
+        ["container", "inspect", container_name], check=False, capture_output=True
+    )
+    if proc.returncode != 0:
+        text = f"{proc.stdout}\n{proc.stderr}".strip().lower()
+        if "not found" in text:
+            return False, "not found"
+        return False, "unavailable"
+
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return False, "inspect output unreadable"
+
+    if not isinstance(payload, list) or not payload:
+        return False, "inspect output invalid"
+
+    status = str(payload[0].get("status", "")).strip().lower()
+    if status == "running":
+        return True, "running"
+    if status:
+        return False, status
+    return False, "unknown"
+
+
 def ensure_runner_config_ready(runner_data_dir: Path) -> Path:
     dir_exists, file_exists, config_path = validate_runner_data_paths(runner_data_dir)
 
@@ -508,6 +534,15 @@ def cmd_status(args: argparse.Namespace) -> int:
     if config_exists:
         config_valid, config_valid_detail, _parsed = validate_runner_config(config_path)
 
+    dind_running = False
+    dind_detail = "skipped: container CLI not responsive"
+    runner_running = False
+    runner_detail = "skipped: container CLI not responsive"
+
+    if cli_responsive:
+        dind_running, dind_detail = container_running_state(args.dind_name)
+        runner_running, runner_detail = container_running_state(args.runner_name)
+
     rows = [
         (
             "container CLI installed",
@@ -544,6 +579,16 @@ def cmd_status(args: argparse.Namespace) -> int:
             "OK",
             "frccc sets DOCKER_HOST + CONTAINER_DOCKER_HOST at container start",
         ),
+        (
+            "docker sidecar running",
+            "OK" if dind_running else "FAIL",
+            f"{args.dind_name}: {dind_detail}",
+        ),
+        (
+            "runner container running",
+            "OK" if runner_running else "FAIL",
+            f"{args.runner_name}: {runner_detail}",
+        ),
     ]
 
     print_status_table(rows)
@@ -558,6 +603,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         and data_dir_exists
         and config_exists
         and config_valid
+        and dind_running
+        and runner_running
     )
     return 0 if all_required_ok else 1
 
@@ -583,13 +630,14 @@ def cmd_test(args: argparse.Namespace) -> int:
     suffix = uuid.uuid4().hex[:8]
     network_name = f"frccc-test-net-{suffix}"
     dind_name = f"frccc-test-dind-{suffix}"
+    dind_volume = f"frccc-test-vol-{suffix}"
     test_image_tag = f"frccc-test-image:{suffix}"
 
     print("Preparing temporary test environment...")
     run(["container", "network", "create", network_name])
 
     try:
-        start_dind_container(dind_name, network_name, f"frccc-test-vol-{suffix}", 0)
+        start_dind_container(dind_name, network_name, dind_volume, 0)
         dind_host = get_container_ipv4(dind_name, network_name)
         wait_for_dind(dind_host, dind_name, network_name, args.timeout)
 
@@ -609,6 +657,7 @@ def cmd_test(args: argparse.Namespace) -> int:
     finally:
         run(["container", "delete", "-f", dind_name], check=False)
         run(["container", "network", "delete", network_name], check=False)
+        run(["container", "volume", "delete", dind_volume], check=False)
 
 
 def cmd_start(args: argparse.Namespace) -> int:
@@ -688,6 +737,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show environment and runner-config status checks",
     )
     status.add_argument("--runner-data-dir", default=DEFAULT_RUNNER_DATA_DIR)
+    status.add_argument("--runner-name", default=DEFAULT_RUNNER_NAME)
+    status.add_argument("--dind-name", default=DEFAULT_DIND_NAME)
     status.set_defaults(func=cmd_status)
 
     build = sub.add_parser(
