@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import re
 import shutil
 import subprocess
 import sys
@@ -12,6 +14,13 @@ from pathlib import Path
 
 DEFAULT_IMAGE_TAG = "local/forgejo-runner-docker:12"
 DEFAULT_TEST_TIMEOUT_SECONDS = 60
+DEFAULT_NETWORK_NAME = "forgejo-net"
+DEFAULT_RUNNER_NAME = "forgejo-runner"
+DEFAULT_DIND_NAME = "docker-dind"
+DEFAULT_DIND_VOLUME = "forgejo-dind-data"
+DEFAULT_DIND_PORT = 2375
+DEFAULT_RUNNER_DATA_DIR = "./runner-data"
+DEFAULT_RUNNER_CONFIG = "runner-config.yml"
 
 
 class CliError(RuntimeError):
@@ -171,8 +180,13 @@ def write_test_container_context(target_dir: Path) -> None:
     marker.write_text("hello from frccc test\n")
 
 
-def start_temp_dind(dind_name: str, network_name: str) -> None:
-    base_cmd = [
+def start_dind_container(
+    dind_name: str,
+    network_name: str,
+    dind_volume: str,
+    dind_port: int,
+) -> None:
+    common = [
         "container",
         "run",
         "-d",
@@ -180,6 +194,14 @@ def start_temp_dind(dind_name: str, network_name: str) -> None:
         dind_name,
         "--network",
         network_name,
+        "-v",
+        f"{dind_volume}:/var/lib/docker",
+    ]
+
+    if dind_port > 0:
+        common.extend(["-p", f"127.0.0.1:{dind_port}:2375"])
+
+    tail = [
         "docker:dind",
         "dockerd",
         "-H",
@@ -187,22 +209,8 @@ def start_temp_dind(dind_name: str, network_name: str) -> None:
         "--tls=false",
     ]
 
-    cmd_with_caps = [
-        "container",
-        "run",
-        "-d",
-        "--name",
-        dind_name,
-        "--network",
-        network_name,
-        "--cap-add",
-        "ALL",
-        "docker:dind",
-        "dockerd",
-        "-H",
-        "tcp://0.0.0.0:2375",
-        "--tls=false",
-    ]
+    base_cmd = [*common, *tail]
+    cmd_with_caps = [*common, "--cap-add", "ALL", *tail]
 
     proc = run(cmd_with_caps, check=False, capture_output=True)
     if proc.returncode == 0:
@@ -228,11 +236,44 @@ def start_temp_dind(dind_name: str, network_name: str) -> None:
     )
 
 
+def create_network_if_missing(network_name: str) -> None:
+    proc = run(
+        ["container", "network", "create", network_name],
+        check=False,
+        capture_output=True,
+    )
+    if proc.returncode == 0:
+        return
+
+    text = f"{proc.stdout}\n{proc.stderr}".lower()
+    if "already exists" in text:
+        return
+
+    raise CliError(
+        f"Failed to create network {network_name}. "
+        f"stdout: {proc.stdout.strip()} stderr: {proc.stderr.strip()}"
+    )
+
+
+def create_volume_if_missing(volume_name: str) -> None:
+    proc = run(
+        ["container", "volume", "create", volume_name], check=False, capture_output=True
+    )
+    if proc.returncode == 0:
+        return
+
+    text = f"{proc.stdout}\n{proc.stderr}".lower()
+    if "already exists" in text:
+        return
+
+    raise CliError(
+        f"Failed to create volume {volume_name}. "
+        f"stdout: {proc.stdout.strip()} stderr: {proc.stderr.strip()}"
+    )
+
+
 def get_container_ipv4(container_name: str, network_name: str) -> str:
     proc = run(["container", "inspect", container_name], capture_output=True)
-
-    # Keep parsing defensive because `container inspect` schema may evolve.
-    import json
 
     payload = json.loads(proc.stdout)
     if not isinstance(payload, list) or not payload:
@@ -241,14 +282,12 @@ def get_container_ipv4(container_name: str, network_name: str) -> str:
     details = payload[0]
     networks = details.get("networks") or []
 
-    # Prefer exact network match first.
     for net in networks:
         net_id = net.get("network") or net.get("id")
         address = net.get("address") or net.get("addr") or net.get("ipv4Address")
         if net_id == network_name and isinstance(address, str) and address:
             return address.split("/")[0]
 
-    # Fallback: first available IPv4-ish address.
     for net in networks:
         address = net.get("address") or net.get("addr") or net.get("ipv4Address")
         if isinstance(address, str) and address:
@@ -259,14 +298,14 @@ def get_container_ipv4(container_name: str, network_name: str) -> str:
     )
 
 
-def wait_for_temp_dind(
+def wait_for_dind(
     dind_host: str,
     dind_name: str,
     network_name: str,
     timeout_seconds: int,
 ) -> None:
     print(
-        f"Waiting for temp docker:dind to become ready at {dind_host}:2375 (timeout: {timeout_seconds}s)..."
+        f"Waiting for docker:dind to become ready at {dind_host}:2375 (timeout: {timeout_seconds}s)..."
     )
     deadline = time.monotonic() + timeout_seconds
 
@@ -287,13 +326,13 @@ def wait_for_temp_dind(
             capture_output=True,
         )
         if probe.returncode == 0:
-            print("Temp docker:dind is ready.")
+            print("docker:dind is ready.")
             return
 
         time.sleep(1)
 
     raise CliError(
-        "Timed out waiting for temporary docker:dind to become ready. "
+        "Timed out waiting for docker:dind to become ready. "
         f"Check logs with: container logs -n 200 {dind_name}"
     )
 
@@ -329,7 +368,106 @@ def run_temp_runner_docker_build(
     )
 
 
-def cmd_status(_: argparse.Namespace) -> int:
+def parse_simple_yaml(
+    config_path: Path,
+) -> tuple[dict[tuple[str, ...], str], list[str]]:
+    values: dict[tuple[str, ...], str] = {}
+    errors: list[str] = []
+    stack: list[tuple[int, str]] = []
+
+    key_pattern = re.compile(r"^(\s*)([^:#\n][^:\n]*?):(?:\s*(.*))?$")
+
+    for line_no, raw_line in enumerate(config_path.read_text().splitlines(), start=1):
+        line = raw_line.rstrip()
+        stripped = line.strip()
+
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("-"):
+            continue
+
+        match = key_pattern.match(line)
+        if not match:
+            continue
+
+        indent = len(match.group(1))
+        key = match.group(2).strip().strip('"').strip("'")
+        value = match.group(3)
+
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+
+        path = tuple([part for _, part in stack] + [key])
+
+        if value is None or value == "":
+            stack.append((indent, key))
+            continue
+
+        v = value.strip()
+        if v.startswith("#"):
+            v = ""
+
+        if v in ("|", ">"):
+            errors.append(
+                f"line {line_no}: block scalar is not supported by this validator"
+            )
+            continue
+
+        values[path] = v.strip('"').strip("'")
+
+    return values, errors
+
+
+def validate_runner_data_paths(
+    runner_data_dir: Path,
+) -> tuple[bool, bool, Path]:
+    config_path = runner_data_dir / DEFAULT_RUNNER_CONFIG
+    return runner_data_dir.is_dir(), config_path.is_file(), config_path
+
+
+def validate_runner_config(
+    config_path: Path,
+) -> tuple[bool, str, dict[tuple[str, ...], str]]:
+    if not config_path.is_file():
+        return False, "file not found", {}
+
+    try:
+        values, errors = parse_simple_yaml(config_path)
+    except Exception as exc:
+        return False, f"unreadable: {exc}", {}
+
+    if errors:
+        return False, "; ".join(errors), values
+
+    if not values:
+        return False, "no key/value entries found", values
+
+    return True, "basic YAML structure parsed", values
+
+
+def ensure_runner_config_ready(runner_data_dir: Path) -> Path:
+    dir_exists, file_exists, config_path = validate_runner_data_paths(runner_data_dir)
+
+    if not dir_exists:
+        raise CliError(
+            f"Missing runner data directory: {runner_data_dir}. "
+            "Create it and place runner-config.yml there."
+        )
+
+    if not file_exists:
+        raise CliError(
+            f"Missing runner config file: {config_path}. "
+            "Create runner-data/runner-config.yml first."
+        )
+
+    valid, detail, parsed = validate_runner_config(config_path)
+    if not valid:
+        raise CliError(f"runner-config.yml is not valid enough to use: {detail}")
+
+    return config_path
+
+
+def cmd_status(args: argparse.Namespace) -> int:
     container_cli_installed = shutil.which("container") is not None
 
     if container_cli_installed:
@@ -359,6 +497,17 @@ def cmd_status(_: argparse.Namespace) -> int:
         brew_row_status = "WARN"
         brew_detail = brew_status
 
+    runner_data_dir = Path(args.runner_data_dir)
+    data_dir_exists, config_exists, config_path = validate_runner_data_paths(
+        runner_data_dir
+    )
+
+    config_valid = False
+    config_valid_detail = "skipped: config file not found"
+
+    if config_exists:
+        config_valid, config_valid_detail, _parsed = validate_runner_config(config_path)
+
     rows = [
         (
             "container CLI installed",
@@ -375,6 +524,26 @@ def cmd_status(_: argparse.Namespace) -> int:
             brew_row_status,
             brew_detail,
         ),
+        (
+            "runner-data directory",
+            "OK" if data_dir_exists else "FAIL",
+            str(runner_data_dir.resolve()) if data_dir_exists else "missing",
+        ),
+        (
+            "runner-config.yml exists",
+            "OK" if config_exists else "FAIL",
+            str(config_path.resolve()) if config_exists else "missing",
+        ),
+        (
+            "runner-config.yml valid",
+            "OK" if config_valid else "FAIL",
+            config_valid_detail,
+        ),
+        (
+            "docker runtime wiring",
+            "OK",
+            "frccc sets DOCKER_HOST + CONTAINER_DOCKER_HOST at container start",
+        ),
     ]
 
     print_status_table(rows)
@@ -383,7 +552,14 @@ def cmd_status(_: argparse.Namespace) -> int:
         print("\nTo start the container service:")
         print("  brew services start container")
 
-    return 0 if container_cli_installed and cli_responsive else 1
+    all_required_ok = (
+        container_cli_installed
+        and cli_responsive
+        and data_dir_exists
+        and config_exists
+        and config_valid
+    )
+    return 0 if all_required_ok else 1
 
 
 def cmd_build(args: argparse.Namespace) -> int:
@@ -413,9 +589,9 @@ def cmd_test(args: argparse.Namespace) -> int:
     run(["container", "network", "create", network_name])
 
     try:
-        start_temp_dind(dind_name, network_name)
+        start_dind_container(dind_name, network_name, f"frccc-test-vol-{suffix}", 0)
         dind_host = get_container_ipv4(dind_name, network_name)
-        wait_for_temp_dind(dind_host, dind_name, network_name, args.timeout)
+        wait_for_dind(dind_host, dind_name, network_name, args.timeout)
 
         with tempfile.TemporaryDirectory(prefix="frccc-test-") as tmpdir:
             context_dir = Path(tmpdir)
@@ -435,6 +611,70 @@ def cmd_test(args: argparse.Namespace) -> int:
         run(["container", "network", "delete", network_name], check=False)
 
 
+def cmd_start(args: argparse.Namespace) -> int:
+    ensure_container_binary()
+    require_container_service_running()
+
+    runner_data_dir = Path(args.runner_data_dir)
+    config_path = ensure_runner_config_ready(runner_data_dir)
+
+    create_network_if_missing(args.network_name)
+    create_volume_if_missing(args.dind_volume)
+
+    run(["container", "delete", "-f", args.runner_name], check=False)
+    run(["container", "delete", "-f", args.dind_name], check=False)
+
+    start_dind_container(
+        dind_name=args.dind_name,
+        network_name=args.network_name,
+        dind_volume=args.dind_volume,
+        dind_port=args.dind_port,
+    )
+
+    dind_host = get_container_ipv4(args.dind_name, args.network_name)
+    wait_for_dind(dind_host, args.dind_name, args.network_name, args.timeout)
+
+    docker_host = f"tcp://{dind_host}:2375"
+    run(
+        [
+            "container",
+            "run",
+            "-d",
+            "--name",
+            args.runner_name,
+            "--network",
+            args.network_name,
+            "-e",
+            f"DOCKER_HOST={docker_host}",
+            "-e",
+            f"CONTAINER_DOCKER_HOST={docker_host}",
+            "-v",
+            f"{runner_data_dir.resolve()}:/data",
+            args.tag,
+            "forgejo-runner",
+            "daemon",
+            "--config",
+            f"/data/{config_path.name}",
+        ]
+    )
+
+    print("Runner stack started.")
+    print(f"- docker sidecar: {args.dind_name} ({docker_host})")
+    print(f"- runner: {args.runner_name}")
+    return 0
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    ensure_container_binary()
+    require_container_service_running()
+
+    run(["container", "delete", "-f", args.runner_name], check=False)
+    run(["container", "delete", "-f", args.dind_name], check=False)
+
+    print("Runner stack stopped.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="frccc",
@@ -445,8 +685,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser(
         "status",
-        help="Check whether Apple's container service is running",
+        help="Show environment and runner-config status checks",
     )
+    status.add_argument("--runner-data-dir", default=DEFAULT_RUNNER_DATA_DIR)
     status.set_defaults(func=cmd_status)
 
     build = sub.add_parser(
@@ -468,6 +709,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds to wait for temporary docker:dind to become ready",
     )
     test.set_defaults(func=cmd_test)
+
+    start = sub.add_parser(
+        "start",
+        help="Start docker:dind and forgejo-runner containers",
+    )
+    start.add_argument("--tag", default=DEFAULT_IMAGE_TAG)
+    start.add_argument("--network-name", default=DEFAULT_NETWORK_NAME)
+    start.add_argument("--runner-name", default=DEFAULT_RUNNER_NAME)
+    start.add_argument("--dind-name", default=DEFAULT_DIND_NAME)
+    start.add_argument("--dind-volume", default=DEFAULT_DIND_VOLUME)
+    start.add_argument("--dind-port", type=int, default=DEFAULT_DIND_PORT)
+    start.add_argument("--runner-data-dir", default=DEFAULT_RUNNER_DATA_DIR)
+    start.add_argument("--timeout", type=int, default=DEFAULT_TEST_TIMEOUT_SECONDS)
+    start.set_defaults(func=cmd_start)
+
+    stop = sub.add_parser(
+        "stop",
+        help="Stop and remove docker:dind and forgejo-runner containers",
+    )
+    stop.add_argument("--runner-name", default=DEFAULT_RUNNER_NAME)
+    stop.add_argument("--dind-name", default=DEFAULT_DIND_NAME)
+    stop.set_defaults(func=cmd_stop)
 
     return parser
 
