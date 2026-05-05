@@ -471,6 +471,38 @@ def container_running_state(container_name: str) -> tuple[bool, str]:
     return False, "unknown"
 
 
+def resolve_runner_env_file_path(
+    runner_data_dir: Path,
+    parsed_values: dict[tuple[str, ...], str],
+) -> Path | None:
+    env_file = parsed_values.get(("runner", "env_file"), "").strip()
+    if not env_file:
+        return None
+
+    env_path = Path(env_file)
+    if env_path.is_absolute():
+        return env_path
+
+    return runner_data_dir / env_path
+
+
+def write_runner_env_file(
+    runner_data_dir: Path, config_path: Path, docker_host: str
+) -> None:
+    valid, detail, parsed_values = validate_runner_config(config_path)
+    if not valid:
+        raise CliError(f"runner-config.yml became invalid: {detail}")
+
+    env_file_path = resolve_runner_env_file_path(runner_data_dir, parsed_values)
+    if env_file_path is None:
+        return
+
+    env_file_path.parent.mkdir(parents=True, exist_ok=True)
+    env_file_path.write_text(
+        f"DOCKER_HOST={docker_host}\nCONTAINER_DOCKER_HOST={docker_host}\n"
+    )
+
+
 def ensure_runner_config_ready(runner_data_dir: Path) -> Path:
     dir_exists, file_exists, config_path = validate_runner_data_paths(runner_data_dir)
 
@@ -684,6 +716,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     wait_for_dind(dind_host, args.dind_name, args.network_name, args.timeout)
 
     docker_host = f"tcp://{dind_host}:2375"
+    write_runner_env_file(runner_data_dir, config_path, docker_host)
+
     run(
         [
             "container",
