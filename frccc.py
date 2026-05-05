@@ -2,21 +2,11 @@
 from __future__ import annotations
 
 import argparse
-import json
 import shutil
-import socket
 import subprocess
 import sys
-import time
-from pathlib import Path
 
-DEFAULT_NETWORK = "forgejo-net"
-DEFAULT_RUNNER_NAME = "forgejo-runner"
-DEFAULT_DIND_NAME = "docker-dind"
-DEFAULT_DIND_VOLUME = "forgejo-dind-data"
-DEFAULT_DIND_PORT = 2375
-DEFAULT_BASE_IMAGE = "data.forgejo.org/forgejo/runner:12"
-DEFAULT_DOCKER_RUNNER_IMAGE = "local/forgejo-runner-docker:12"
+DEFAULT_IMAGE_TAG = "local/forgejo-runner-docker:12"
 
 
 class CliError(RuntimeError):
@@ -42,429 +32,160 @@ def ensure_container_binary() -> None:
         )
 
 
-def ensure_container_system_started() -> None:
-    run(["container", "system", "start"])
+def container_cli_responsive() -> bool:
+    proc = run(["container", "list", "--all"], check=False, capture_output=True)
+    return proc.returncode == 0
 
 
-def ensure_network_exists(network_name: str) -> None:
-    proc = run(
-        ["container", "network", "list", "--format", "json"], capture_output=True
-    )
-    raw = proc.stdout
+def brew_service_status(service_name: str) -> str | None:
+    if shutil.which("brew") is None:
+        return None
 
-    exists = f'"{network_name}"' in raw
-    if not exists:
-        run(["container", "network", "create", network_name])
+    proc = run(["brew", "services", "list"], check=False, capture_output=True)
+    if proc.returncode != 0:
+        return "unknown"
 
+    for line in proc.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.lower().startswith("name"):
+            continue
 
-def ensure_volume_exists(volume_name: str) -> None:
-    proc = run(["container", "volume", "list", "--format", "json"], capture_output=True)
-    raw = proc.stdout
+        parts = stripped.split()
+        if parts and parts[0] == service_name:
+            if len(parts) >= 2:
+                return parts[1]
+            return "unknown"
 
-    exists = f'"{volume_name}"' in raw
-    if not exists:
-        run(["container", "volume", "create", volume_name])
-
-
-def ensure_runner_config(base_image: str, runner_config: Path) -> None:
-    runner_config.parent.mkdir(parents=True, exist_ok=True)
-    if runner_config.exists():
-        print(f"Runner config exists: {runner_config}")
-        return
-
-    proc = run(
-        ["container", "run", "--rm", base_image, "forgejo-runner", "generate-config"],
-        capture_output=True,
-    )
-    runner_config.write_text(proc.stdout)
-    print(f"Generated config: {runner_config}")
+    return "not-listed"
 
 
-def runner_registered_marker(runner_config: Path) -> Path:
-    return runner_config.parent / ".runner"
-
-
-def register_runner_non_interactive(
-    *,
-    base_image: str,
-    runner_config: Path,
-    runner_name: str,
-    runner_labels: str,
-    forgejo_url: str,
-    runner_token: str,
-) -> None:
-    marker = runner_registered_marker(runner_config)
-    if marker.exists():
-        print(f"Runner registration exists: {marker}")
-        return
-
-    config_dir = runner_config.parent.resolve()
-    config_name = runner_config.name
-
-    run(
-        [
-            "container",
-            "run",
-            "--rm",
-            "-i",
-            "-v",
-            f"{config_dir}:/data",
-            base_image,
-            "forgejo-runner",
-            "register",
-            "--no-interactive",
-            "--instance",
-            forgejo_url,
-            "--token",
-            runner_token,
-            "--name",
-            runner_name,
-            "--labels",
-            runner_labels,
-            "--config",
-            f"/data/{config_name}",
-        ]
-    )
-
-
-def wait_for_dind(
-    *,
-    dind_name: str,
-    dind_port: int,
-    timeout_seconds: int,
-) -> None:
-    print(
-        f"Waiting for Docker daemon in {dind_name} on 127.0.0.1:{dind_port} "
-        f"(timeout: {timeout_seconds}s)..."
-    )
-    deadline = time.monotonic() + timeout_seconds
-
-    while time.monotonic() < deadline:
-        try:
-            with socket.create_connection(("127.0.0.1", dind_port), timeout=2):
-                print("Docker daemon TCP port is reachable.")
-                return
-        except OSError:
-            time.sleep(1)
-
-    raise CliError(
-        "Timed out waiting for docker:dind TCP port to become ready. "
-        "Check logs with: container logs -n 200 docker-dind"
-    )
-
-
-def start_dind_container(
-    *,
-    dind_name: str,
-    network_name: str,
-    dind_volume: str,
-    dind_port: int,
-) -> None:
-    run(["container", "delete", "-f", dind_name], check=False)
-
-    base_cmd = [
-        "container",
-        "run",
-        "-d",
-        "--name",
-        dind_name,
-        "--network",
-        network_name,
-        "-v",
-        f"{dind_volume}:/var/lib/docker",
-        "-p",
-        f"127.0.0.1:{dind_port}:2375",
-        "docker:dind",
-        "dockerd",
-        "-H",
-        "tcp://0.0.0.0:2375",
-        "--tls=false",
-    ]
-
-    cmd_with_caps = [
-        "container",
-        "run",
-        "-d",
-        "--name",
-        dind_name,
-        "--network",
-        network_name,
-        "--cap-add",
-        "ALL",
-        "-v",
-        f"{dind_volume}:/var/lib/docker",
-        "-p",
-        f"127.0.0.1:{dind_port}:2375",
-        "docker:dind",
-        "dockerd",
-        "-H",
-        "tcp://0.0.0.0:2375",
-        "--tls=false",
-    ]
-    proc = run(cmd_with_caps, check=False, capture_output=True)
-    if proc.returncode == 0:
-        return
-
-    combined = f"{proc.stdout}\n{proc.stderr}".lower()
-    if (
-        "unknown option '--cap-add'" in combined
-        or 'unknown option "--cap-add"' in combined
-    ):
-        print(
-            "`container run` does not support --cap-add on this version; retrying without it."
-        )
-        proc2 = run(base_cmd, check=False, capture_output=True)
-        if proc2.returncode == 0:
-            return
+def require_container_service_running() -> None:
+    if not container_cli_responsive():
         raise CliError(
-            "Failed to start docker:dind without --cap-add. "
-            f"stdout: {proc2.stdout.strip()} stderr: {proc2.stderr.strip()}"
+            "Container service does not appear to be running. "
+            "Start it first with `brew services start container`."
         )
 
-    raise CliError(
-        "Failed to start docker:dind. "
-        f"stdout: {proc.stdout.strip()} stderr: {proc.stderr.strip()}"
+
+def ensure_builder_ready() -> None:
+    print("Running build preflight: checking builder...")
+    status_proc = run(
+        ["container", "builder", "status"], check=False, capture_output=True
     )
+    status_text = f"{status_proc.stdout}\n{status_proc.stderr}".strip().lower()
 
+    if "is running" in status_text:
+        print("Builder is already running.")
+        return
 
-def get_container_ip(
-    container_name: str,
-    network_name: str,
-    timeout_seconds: int = 30,
-) -> str:
-    deadline = time.monotonic() + timeout_seconds
+    print("Builder is not ready. Attempting recovery (stop/delete/start).")
+    run(["container", "builder", "stop"], check=False)
+    run(["container", "builder", "delete"], check=False)
 
-    while time.monotonic() < deadline:
-        proc = run(
-            ["container", "inspect", container_name], check=False, capture_output=True
+    start_proc = run(
+        ["container", "builder", "start"], check=False, capture_output=True
+    )
+    if start_proc.returncode != 0:
+        raise CliError(
+            "Failed to start builder during preflight. "
+            f"stdout: {start_proc.stdout.strip()} stderr: {start_proc.stderr.strip()}"
         )
-        if proc.returncode != 0:
-            time.sleep(1)
-            continue
 
-        try:
-            payload = json.loads(proc.stdout)
-        except json.JSONDecodeError:
-            time.sleep(1)
-            continue
-
-        if not isinstance(payload, list) or not payload:
-            time.sleep(1)
-            continue
-
-        details = payload[0]
-        networks = details.get("networks") or []
-
-        for net in networks:
-            net_id = net.get("network") or net.get("id")
-            addr = net.get("address") or net.get("addr") or net.get("ipv4Address") or ""
-            if net_id == network_name and addr:
-                return str(addr).split("/")[0]
-
-        for net in networks:
-            addr = net.get("address") or net.get("addr") or net.get("ipv4Address") or ""
-            if addr:
-                return str(addr).split("/")[0]
-
-        time.sleep(1)
-
-    raise CliError(
-        f"Container {container_name} has no network address after {timeout_seconds}s"
+    verify_proc = run(
+        ["container", "builder", "status"], check=False, capture_output=True
     )
+    verify_text = f"{verify_proc.stdout}\n{verify_proc.stderr}".strip().lower()
+    if "is running" not in verify_text:
+        raise CliError(
+            "Builder preflight did not reach a running state. "
+            f"status output: {verify_proc.stdout.strip()} {verify_proc.stderr.strip()}"
+        )
+
+    print("Builder preflight completed.")
 
 
-def start_runner_container(
-    *,
-    runner_image: str,
-    network_name: str,
-    runner_name: str,
-    runner_config: Path,
-    docker_host: str | None,
-) -> None:
-    run(["container", "delete", "-f", runner_name], check=False)
+def print_status_table(rows: list[tuple[str, str, str]]) -> None:
+    headers = ("Check", "Status", "Details")
+    widths = [len(headers[0]), len(headers[1]), len(headers[2])]
 
-    config_dir = runner_config.parent.resolve()
-    config_name = runner_config.name
+    for check, status, details in rows:
+        widths[0] = max(widths[0], len(check))
+        widths[1] = max(widths[1], len(status))
+        widths[2] = max(widths[2], len(details))
 
-    cmd = [
-        "container",
-        "run",
-        "-d",
-        "--name",
-        runner_name,
-        "--network",
-        network_name,
-        "-v",
-        f"{config_dir}:/data",
+    def fmt_row(c1: str, c2: str, c3: str) -> str:
+        return f"{c1:<{widths[0]}} | {c2:<{widths[1]}} | {c3:<{widths[2]}}"
+
+    separator = f"{'-' * widths[0]}-+-{'-' * widths[1]}-+-{'-' * widths[2]}"
+
+    print(fmt_row(*headers))
+    print(separator)
+    for row in rows:
+        print(fmt_row(*row))
+
+
+def cmd_status(_: argparse.Namespace) -> int:
+    container_cli_installed = shutil.which("container") is not None
+
+    if container_cli_installed:
+        cli_responsive = container_cli_responsive()
+        cli_detail = "responsive" if cli_responsive else "not responsive"
+    else:
+        cli_responsive = False
+        cli_detail = "skipped: `container` command not found"
+
+    brew_status = brew_service_status("container")
+    if brew_status is None:
+        brew_row_status = "WARN"
+        brew_detail = "`brew` command not found"
+    elif brew_status == "started":
+        brew_row_status = "OK"
+        brew_detail = "started"
+    elif brew_status == "none":
+        brew_row_status = "WARN"
+        brew_detail = "not started"
+    elif brew_status == "not-listed":
+        brew_row_status = "WARN"
+        brew_detail = "service not listed"
+    elif brew_status == "unknown":
+        brew_row_status = "WARN"
+        brew_detail = "unable to determine status"
+    else:
+        brew_row_status = "WARN"
+        brew_detail = brew_status
+
+    rows = [
+        (
+            "container CLI installed",
+            "OK" if container_cli_installed else "FAIL",
+            "found on PATH" if container_cli_installed else "not found",
+        ),
+        (
+            "container CLI responsive",
+            "OK" if cli_responsive else "FAIL",
+            cli_detail,
+        ),
+        (
+            "brew service (container)",
+            brew_row_status,
+            brew_detail,
+        ),
     ]
 
-    if docker_host:
-        cmd.extend(["-e", f"DOCKER_HOST=tcp://{docker_host}:2375"])
+    print_status_table(rows)
 
-    cmd.extend(
-        [
-            runner_image,
-            "forgejo-runner",
-            "daemon",
-            "--config",
-            f"/data/{config_name}",
-        ]
-    )
+    if not cli_responsive:
+        print("\nTo start the container service:")
+        print("  brew services start container")
 
-    run(cmd)
+    return 0 if container_cli_installed and cli_responsive else 1
 
 
-def resolve_runner_image(args: argparse.Namespace) -> str:
-    if args.runner_image:
-        return args.runner_image
-    if args.with_docker:
-        return DEFAULT_DOCKER_RUNNER_IMAGE
-    return args.base_image
-
-
-def image_exists_local(reference: str) -> bool:
-    proc = run(["container", "image", "list", "--format", "json"], capture_output=True)
-    try:
-        rows = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return False
-
-    ref_lower = reference.lower()
-    if isinstance(rows, list):
-        for row in rows:
-            for key in ("name", "Name", "reference", "Reference", "id", "ID"):
-                val = row.get(key)
-                if isinstance(val, str) and val.lower() == ref_lower:
-                    return True
-    return False
-
-
-def cmd_start(args: argparse.Namespace) -> int:
+def cmd_build(args: argparse.Namespace) -> int:
     ensure_container_binary()
-    ensure_container_system_started()
+    require_container_service_running()
+    ensure_builder_ready()
 
-    runner_data_dir = Path(args.runner_data_dir)
-    runner_data_dir.mkdir(parents=True, exist_ok=True)
-
-    runner_config = (
-        Path(args.runner_config)
-        if args.runner_config
-        else runner_data_dir / "runner-config.yml"
-    )
-
-    ensure_network_exists(args.network_name)
-    ensure_runner_config(args.base_image, runner_config)
-
-    if args.forgejo_url and args.runner_token:
-        register_runner_non_interactive(
-            base_image=args.base_image,
-            runner_config=runner_config,
-            runner_name=args.runner_name,
-            runner_labels=args.runner_labels,
-            forgejo_url=args.forgejo_url,
-            runner_token=args.runner_token,
-        )
-    else:
-        print(
-            "Skipping registration (missing --forgejo-url or --runner-token). "
-            "You can still start the container, but jobs will not be picked up until registered."
-        )
-
-    runner_image = resolve_runner_image(args)
-
-    if args.with_docker and not args.runner_image:
-        if not image_exists_local(runner_image):
-            raise CliError(
-                f"Runner image {runner_image} is not available locally. "
-                "Build it with `./frccc.py build-runner-image` or pass --runner-image."
-            )
-
-    if args.with_docker:
-        ensure_volume_exists(args.dind_volume)
-        start_dind_container(
-            dind_name=args.dind_name,
-            network_name=args.network_name,
-            dind_volume=args.dind_volume,
-            dind_port=args.dind_port,
-        )
-        wait_for_dind(
-            dind_name=args.dind_name,
-            dind_port=args.dind_port,
-            timeout_seconds=args.dind_wait_timeout,
-        )
-        if args.dind_host:
-            docker_host = args.dind_host
-        else:
-            docker_host = get_container_ip(args.dind_name, args.network_name)
-        print(f"Selected Docker host for runner: {docker_host}")
-    else:
-        docker_host = None
-
-    start_runner_container(
-        runner_image=runner_image,
-        network_name=args.network_name,
-        runner_name=args.runner_name,
-        runner_config=runner_config,
-        docker_host=docker_host,
-    )
-
-    print("Runner started.")
-    if args.with_docker:
-        print(
-            f"Docker sidecar started: {args.dind_name} on tcp://127.0.0.1:{args.dind_port}"
-        )
-    print("Use `./frccc.py logs -f` to follow runner logs.")
-    return 0
-
-
-def cmd_status(args: argparse.Namespace) -> int:
-    ensure_container_binary()
-    ensure_container_system_started()
-    run(["container", "list", "--all"])
-    return 0
-
-
-def cmd_logs(args: argparse.Namespace) -> int:
-    ensure_container_binary()
-    ensure_container_system_started()
-
-    targets: list[str]
-    if args.target == "both":
-        targets = [args.runner_name, args.dind_name]
-    elif args.target == "dind":
-        targets = [args.dind_name]
-    else:
-        targets = [args.runner_name]
-
-    for idx, target in enumerate(targets):
-        if len(targets) > 1:
-            print(f"\n===== logs: {target} =====")
-        cmd = ["container", "logs"]
-        if args.follow:
-            cmd.append("-f")
-        if args.lines is not None:
-            cmd.extend(["-n", str(args.lines)])
-        cmd.append(target)
-        run(cmd)
-        if args.follow and idx < len(targets) - 1:
-            break
-
-    return 0
-
-
-def cmd_stop(args: argparse.Namespace) -> int:
-    ensure_container_binary()
-    ensure_container_system_started()
-
-    run(["container", "stop", args.runner_name], check=False)
-    run(["container", "stop", args.dind_name], check=False)
-    print("Stopped runner and docker sidecar (if running).")
-    return 0
-
-
-def cmd_build_runner_image(args: argparse.Namespace) -> int:
-    ensure_container_binary()
-    ensure_container_system_started()
     run(["container", "build", "-t", args.tag, "."])
     print(f"Built image: {args.tag}")
     return 0
@@ -478,71 +199,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    start = sub.add_parser("start", help="Start Forgejo runner in container")
-    start.add_argument("--network-name", default=DEFAULT_NETWORK)
-    start.add_argument("--runner-name", default=DEFAULT_RUNNER_NAME)
-    start.add_argument("--runner-data-dir", default="./runner-data")
-    start.add_argument(
-        "-c",
-        "--runner-config",
-        default=None,
-        help="Path to runner config file (default: <runner-data-dir>/runner-config.yml)",
+    status = sub.add_parser(
+        "status",
+        help="Check whether Apple's container service is running",
     )
-    start.add_argument("--base-image", default=DEFAULT_BASE_IMAGE)
-    start.add_argument(
-        "--runner-image",
-        default=None,
-        help=(
-            "Runner image used for daemon. "
-            "Default is base image without --with-docker, "
-            "or local/forgejo-runner-docker:12 with --with-docker."
-        ),
-    )
-    start.add_argument("--runner-labels", default="container,macos")
-    start.add_argument("--forgejo-url", default=None)
-    start.add_argument("--runner-token", default=None)
-    start.add_argument(
-        "--with-docker",
-        action="store_true",
-        help="Start docker:dind sidecar and connect runner to it via DOCKER_HOST",
-    )
-    start.add_argument("--dind-name", default=DEFAULT_DIND_NAME)
-    start.add_argument(
-        "--dind-host",
-        default=None,
-        help="Host/IP for runner to reach Docker daemon (default: DinD container IP on selected network)",
-    )
-    start.add_argument("--dind-volume", default=DEFAULT_DIND_VOLUME)
-    start.add_argument("--dind-port", type=int, default=DEFAULT_DIND_PORT)
-    start.add_argument("--dind-wait-timeout", type=int, default=60)
-    start.set_defaults(func=cmd_start)
-
-    status = sub.add_parser("status", help="Show container status")
     status.set_defaults(func=cmd_status)
 
-    logs = sub.add_parser("logs", help="Show logs")
-    logs.add_argument("--runner-name", default=DEFAULT_RUNNER_NAME)
-    logs.add_argument("--dind-name", default=DEFAULT_DIND_NAME)
-    logs.add_argument(
-        "--target",
-        choices=["runner", "dind", "both"],
-        default="runner",
-        help="Which logs to show",
-    )
-    logs.add_argument("-n", "--lines", type=int, default=100)
-    logs.add_argument("-f", "--follow", action="store_true")
-    logs.set_defaults(func=cmd_logs)
-
-    stop = sub.add_parser("stop", help="Stop runner and docker sidecar")
-    stop.add_argument("--runner-name", default=DEFAULT_RUNNER_NAME)
-    stop.add_argument("--dind-name", default=DEFAULT_DIND_NAME)
-    stop.set_defaults(func=cmd_stop)
-
     build = sub.add_parser(
-        "build-runner-image", help="Build docker-enabled runner image"
+        "build",
+        help="Build the image from Containerfile",
     )
-    build.add_argument("--tag", default=DEFAULT_DOCKER_RUNNER_IMAGE)
-    build.set_defaults(func=cmd_build_runner_image)
+    build.add_argument("--tag", default=DEFAULT_IMAGE_TAG)
+    build.set_defaults(func=cmd_build)
 
     return parser
 
