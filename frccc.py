@@ -11,6 +11,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from typing import Protocol, cast
 
 DEFAULT_IMAGE_TAG = "local/forgejo-runner-docker:12"
 DEFAULT_TEST_TIMEOUT_SECONDS = 60
@@ -25,6 +26,40 @@ DEFAULT_RUNNER_CONFIG = "runner-config.yml"
 
 class CliError(RuntimeError):
     pass
+
+
+JsonObject = dict[str, object]
+
+
+class StatusArgs(Protocol):
+    runner_data_dir: str
+    runner_name: str
+    dind_name: str
+
+
+class BuildArgs(Protocol):
+    tag: str
+
+
+class TestArgs(Protocol):
+    tag: str
+    timeout: int
+
+
+class StartArgs(Protocol):
+    tag: str
+    network_name: str
+    runner_name: str
+    dind_name: str
+    dind_volume: str
+    dind_port: int
+    runner_data_dir: str
+    timeout: int
+
+
+class StopArgs(Protocol):
+    runner_name: str
+    dind_name: str
 
 
 def run(
@@ -270,25 +305,69 @@ def create_volume_if_missing(volume_name: str) -> None:
     )
 
 
+def as_json_object(value: object) -> JsonObject | None:
+    if not isinstance(value, dict):
+        return None
+
+    obj: JsonObject = {}
+    source = cast(dict[object, object], value)
+    for key, val in source.items():
+        if isinstance(key, str):
+            obj[key] = val
+    return obj
+
+
+def as_json_object_list(value: object) -> list[JsonObject]:
+    if not isinstance(value, list):
+        return []
+
+    out: list[JsonObject] = []
+    source = cast(list[object], value)
+    for item in source:
+        obj = as_json_object(item)
+        if obj is not None:
+            out.append(obj)
+    return out
+
+
+def get_obj_str(obj: JsonObject, key: str) -> str | None:
+    value = obj.get(key)
+    if isinstance(value, str):
+        return value
+    return None
+
+
+def parse_container_inspect(stdout: str, container_name: str) -> JsonObject:
+    raw = cast(object, json.loads(stdout))
+    payload = as_json_object_list(raw)
+    if not payload:
+        raise CliError(f"Unexpected inspect output for container {container_name}")
+    return payload[0]
+
+
 def get_container_ipv4(container_name: str, network_name: str) -> str:
     proc = run(["container", "inspect", container_name], capture_output=True)
 
-    payload = json.loads(proc.stdout)
-    if not isinstance(payload, list) or not payload:
-        raise CliError(f"Unexpected inspect output for container {container_name}")
-
-    details = payload[0]
-    networks = details.get("networks") or []
+    details = parse_container_inspect(proc.stdout, container_name)
+    networks = as_json_object_list(details.get("networks"))
 
     for net in networks:
-        net_id = net.get("network") or net.get("id")
-        address = net.get("address") or net.get("addr") or net.get("ipv4Address")
-        if net_id == network_name and isinstance(address, str) and address:
+        net_id = get_obj_str(net, "network") or get_obj_str(net, "id")
+        address = (
+            get_obj_str(net, "address")
+            or get_obj_str(net, "addr")
+            or get_obj_str(net, "ipv4Address")
+        )
+        if net_id == network_name and address:
             return address.split("/")[0]
 
     for net in networks:
-        address = net.get("address") or net.get("addr") or net.get("ipv4Address")
-        if isinstance(address, str) and address:
+        address = (
+            get_obj_str(net, "address")
+            or get_obj_str(net, "addr")
+            or get_obj_str(net, "ipv4Address")
+        )
+        if address:
             return address.split("/")[0]
 
     raise CliError(
@@ -453,14 +532,11 @@ def container_running_state(container_name: str) -> tuple[bool, str]:
         return False, "unavailable"
 
     try:
-        payload = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return False, "inspect output unreadable"
-
-    if not isinstance(payload, list) or not payload:
+        details = parse_container_inspect(proc.stdout, container_name)
+    except (json.JSONDecodeError, CliError):
         return False, "inspect output invalid"
 
-    status = str(payload[0].get("status", "")).strip().lower()
+    status = (get_obj_str(details, "status") or "").strip().lower()
     if status == "running":
         return True, "running"
     if status:
@@ -520,7 +596,7 @@ def ensure_runner_config_ready(runner_data_dir: Path) -> Path:
     return config_path
 
 
-def cmd_status(args: argparse.Namespace) -> int:
+def cmd_status(args: StatusArgs) -> int:
     container_cli_installed = shutil.which("container") is not None
 
     if container_cli_installed:
@@ -636,7 +712,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0 if all_required_ok else 1
 
 
-def cmd_build(args: argparse.Namespace) -> int:
+def cmd_build(args: BuildArgs) -> int:
     ensure_container_binary()
     require_container_service_running()
     ensure_builder_ready()
@@ -646,7 +722,7 @@ def cmd_build(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_test(args: argparse.Namespace) -> int:
+def cmd_test(args: TestArgs) -> int:
     ensure_container_binary()
     require_container_service_running()
     ensure_builder_ready()
@@ -687,7 +763,7 @@ def cmd_test(args: argparse.Namespace) -> int:
         _ = run(["container", "volume", "delete", dind_volume], check=False)
 
 
-def cmd_start(args: argparse.Namespace) -> int:
+def cmd_start(args: StartArgs) -> int:
     ensure_container_binary()
     require_container_service_running()
 
@@ -742,7 +818,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_stop(args: argparse.Namespace) -> int:
+def cmd_stop(args: StopArgs) -> int:
     ensure_container_binary()
     require_container_service_running()
 
@@ -818,18 +894,34 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    command = cast(str, getattr(args, "command", ""))
 
     try:
-        return args.func(args)
+        if command == "status":
+            return cmd_status(cast(StatusArgs, cast(object, args)))
+        if command == "build":
+            return cmd_build(cast(BuildArgs, cast(object, args)))
+        if command == "test":
+            return cmd_test(cast(TestArgs, cast(object, args)))
+        if command == "start":
+            return cmd_start(cast(StartArgs, cast(object, args)))
+        if command == "stop":
+            return cmd_stop(cast(StopArgs, cast(object, args)))
+
+        raise CliError(f"Unknown command: {command}")
     except CliError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
     except subprocess.CalledProcessError as exc:
         print(f"Command failed with exit code {exc.returncode}", file=sys.stderr)
-        if exc.stdout:
-            print(exc.stdout, file=sys.stderr)
-        if exc.stderr:
-            print(exc.stderr, file=sys.stderr)
+        stdout_raw = cast(object, exc.stdout)
+        stderr_raw = cast(object, exc.stderr)
+        stdout_text = stdout_raw if isinstance(stdout_raw, str) else ""
+        stderr_text = stderr_raw if isinstance(stderr_raw, str) else ""
+        if stdout_text:
+            print(stdout_text, file=sys.stderr)
+        if stderr_text:
+            print(stderr_text, file=sys.stderr)
         return exc.returncode
 
 

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/pyright/main/packages/vscode-pyright/schemas/pyrightconfig.schema.json",
+  "typeCheckingMode": "strict",
+  "include": [
+    "frccc.py"
+  ],
+  "exclude": [
+    "__pycache__",
+    "container",
+    "runner-data"
+  ],
+  "pythonVersion": "3.11",
+  "reportReturnType": "error"
+}
