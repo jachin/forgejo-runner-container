@@ -76,8 +76,7 @@ def brew_service_status(service_name: str) -> str | None:
 def require_container_service_running() -> None:
     if not container_cli_responsive():
         raise CliError(
-            "Container service does not appear to be running. "
-            "Start it first with `brew services start container`."
+            "Container service does not appear to be running. Start it first with `brew services start container`."
         )
 
 
@@ -114,16 +113,15 @@ def ensure_builder_ready() -> None:
         return
 
     print("Builder is not ready. Attempting recovery (stop/delete/start).")
-    run(["container", "builder", "stop"], check=False)
-    run(["container", "builder", "delete"], check=False)
+    _ = run(["container", "builder", "stop"], check=False)
+    _ = run(["container", "builder", "delete"], check=False)
 
     start_proc = run(
         ["container", "builder", "start"], check=False, capture_output=True
     )
     if start_proc.returncode != 0:
         raise CliError(
-            "Failed to start builder during preflight. "
-            f"stdout: {start_proc.stdout.strip()} stderr: {start_proc.stderr.strip()}"
+            f"Failed to start builder during preflight. stdout: {start_proc.stdout.strip()} stderr: {start_proc.stderr.strip()}"
         )
 
     verify_proc = run(
@@ -132,8 +130,7 @@ def ensure_builder_ready() -> None:
     verify_text = f"{verify_proc.stdout}\n{verify_proc.stderr}"
     if not builder_status_running(verify_text):
         raise CliError(
-            "Builder preflight did not reach a running state. "
-            f"status output: {verify_proc.stdout.strip()} {verify_proc.stderr.strip()}"
+            f"Builder preflight did not reach a running state. status output: {verify_proc.stdout.strip()} {verify_proc.stderr.strip()}"
         )
 
     print("Builder preflight completed.")
@@ -164,20 +161,25 @@ def build_runner_image(tag: str, *, no_cache: bool = False) -> None:
     if no_cache:
         cmd.append("--no-cache")
     cmd.extend(["-t", tag, "."])
-    run(cmd)
+    _ = run(cmd)
 
 
 def write_test_container_context(target_dir: Path) -> None:
     dockerfile = target_dir / "Dockerfile"
     marker = target_dir / "hello.txt"
 
-    dockerfile.write_text(
-        "FROM alpine:3.20\n"
-        "COPY hello.txt /hello.txt\n"
-        "RUN test -f /hello.txt\n"
-        'CMD ["cat", "/hello.txt"]\n'
+    _ = dockerfile.write_text(
+        "\n".join(
+            [
+                "FROM alpine:3.20",
+                "COPY hello.txt /hello.txt",
+                "RUN test -f /hello.txt",
+                'CMD ["cat", "/hello.txt"]',
+            ]
+        )
+        + "\n"
     )
-    marker.write_text("hello from frccc test\n")
+    _ = marker.write_text("hello from frccc test\n")
 
 
 def start_dind_container(
@@ -226,13 +228,11 @@ def start_dind_container(
         if proc2.returncode == 0:
             return
         raise CliError(
-            "Failed to start docker:dind without --cap-add. "
-            f"stdout: {proc2.stdout.strip()} stderr: {proc2.stderr.strip()}"
+            f"Failed to start docker:dind without --cap-add. stdout: {proc2.stdout.strip()} stderr: {proc2.stderr.strip()}"
         )
 
     raise CliError(
-        "Failed to start docker:dind. "
-        f"stdout: {proc.stdout.strip()} stderr: {proc.stderr.strip()}"
+        f"Failed to start docker:dind. stdout: {proc.stdout.strip()} stderr: {proc.stderr.strip()}"
     )
 
 
@@ -250,8 +250,7 @@ def create_network_if_missing(network_name: str) -> None:
         return
 
     raise CliError(
-        f"Failed to create network {network_name}. "
-        f"stdout: {proc.stdout.strip()} stderr: {proc.stderr.strip()}"
+        f"Failed to create network {network_name}. stdout: {proc.stdout.strip()} stderr: {proc.stderr.strip()}"
     )
 
 
@@ -267,8 +266,7 @@ def create_volume_if_missing(volume_name: str) -> None:
         return
 
     raise CliError(
-        f"Failed to create volume {volume_name}. "
-        f"stdout: {proc.stdout.strip()} stderr: {proc.stderr.strip()}"
+        f"Failed to create volume {volume_name}. stdout: {proc.stdout.strip()} stderr: {proc.stderr.strip()}"
     )
 
 
@@ -332,8 +330,7 @@ def wait_for_dind(
         time.sleep(1)
 
     raise CliError(
-        "Timed out waiting for docker:dind to become ready. "
-        f"Check logs with: container logs -n 200 {dind_name}"
+        f"Timed out waiting for docker:dind to become ready. Check logs with: container logs -n 200 {dind_name}"
     )
 
 
@@ -345,7 +342,7 @@ def run_temp_runner_docker_build(
     context_dir: Path,
     test_image_tag: str,
 ) -> None:
-    run(
+    _ = run(
         [
             "container",
             "run",
@@ -395,7 +392,7 @@ def parse_simple_yaml(
         value = match.group(3)
 
         while stack and indent <= stack[-1][0]:
-            stack.pop()
+            _ = stack.pop()
 
         path = tuple([part for _, part in stack] + [key])
 
@@ -498,7 +495,7 @@ def write_runner_env_file(
         return
 
     env_file_path.parent.mkdir(parents=True, exist_ok=True)
-    env_file_path.write_text(
+    _ = env_file_path.write_text(
         f"DOCKER_HOST={docker_host}\nCONTAINER_DOCKER_HOST={docker_host}\n"
     )
 
@@ -508,17 +505,15 @@ def ensure_runner_config_ready(runner_data_dir: Path) -> Path:
 
     if not dir_exists:
         raise CliError(
-            f"Missing runner data directory: {runner_data_dir}. "
-            "Create it and place runner-config.yml there."
+            f"Missing runner data directory: {runner_data_dir}. Create it and place runner-config.yml there."
         )
 
     if not file_exists:
         raise CliError(
-            f"Missing runner config file: {config_path}. "
-            "Create runner-data/runner-config.yml first."
+            f"Missing runner config file: {config_path}. Create runner-data/runner-config.yml first."
         )
 
-    valid, detail, parsed = validate_runner_config(config_path)
+    valid, detail, _parsed = validate_runner_config(config_path)
     if not valid:
         raise CliError(f"runner-config.yml is not valid enough to use: {detail}")
 
@@ -666,7 +661,7 @@ def cmd_test(args: argparse.Namespace) -> int:
     test_image_tag = f"frccc-test-image:{suffix}"
 
     print("Preparing temporary test environment...")
-    run(["container", "network", "create", network_name])
+    _ = run(["container", "network", "create", network_name])
 
     try:
         start_dind_container(dind_name, network_name, dind_volume, 0)
@@ -687,9 +682,9 @@ def cmd_test(args: argparse.Namespace) -> int:
         print("Test passed: temporary runner successfully built a Docker image.")
         return 0
     finally:
-        run(["container", "delete", "-f", dind_name], check=False)
-        run(["container", "network", "delete", network_name], check=False)
-        run(["container", "volume", "delete", dind_volume], check=False)
+        _ = run(["container", "delete", "-f", dind_name], check=False)
+        _ = run(["container", "network", "delete", network_name], check=False)
+        _ = run(["container", "volume", "delete", dind_volume], check=False)
 
 
 def cmd_start(args: argparse.Namespace) -> int:
@@ -702,8 +697,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     create_network_if_missing(args.network_name)
     create_volume_if_missing(args.dind_volume)
 
-    run(["container", "delete", "-f", args.runner_name], check=False)
-    run(["container", "delete", "-f", args.dind_name], check=False)
+    _ = run(["container", "delete", "-f", args.runner_name], check=False)
+    _ = run(["container", "delete", "-f", args.dind_name], check=False)
 
     start_dind_container(
         dind_name=args.dind_name,
@@ -718,7 +713,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     docker_host = f"tcp://{dind_host}:2375"
     write_runner_env_file(runner_data_dir, config_path, docker_host)
 
-    run(
+    _ = run(
         [
             "container",
             "run",
@@ -751,8 +746,8 @@ def cmd_stop(args: argparse.Namespace) -> int:
     ensure_container_binary()
     require_container_service_running()
 
-    run(["container", "delete", "-f", args.runner_name], check=False)
-    run(["container", "delete", "-f", args.dind_name], check=False)
+    _ = run(["container", "delete", "-f", args.runner_name], check=False)
+    _ = run(["container", "delete", "-f", args.dind_name], check=False)
 
     print("Runner stack stopped.")
     return 0
@@ -770,24 +765,24 @@ def build_parser() -> argparse.ArgumentParser:
         "status",
         help="Show environment and runner-config status checks",
     )
-    status.add_argument("--runner-data-dir", default=DEFAULT_RUNNER_DATA_DIR)
-    status.add_argument("--runner-name", default=DEFAULT_RUNNER_NAME)
-    status.add_argument("--dind-name", default=DEFAULT_DIND_NAME)
+    _ = status.add_argument("--runner-data-dir", default=DEFAULT_RUNNER_DATA_DIR)
+    _ = status.add_argument("--runner-name", default=DEFAULT_RUNNER_NAME)
+    _ = status.add_argument("--dind-name", default=DEFAULT_DIND_NAME)
     status.set_defaults(func=cmd_status)
 
     build = sub.add_parser(
         "build",
         help="Build the image from Containerfile",
     )
-    build.add_argument("--tag", default=DEFAULT_IMAGE_TAG)
+    _ = build.add_argument("--tag", default=DEFAULT_IMAGE_TAG)
     build.set_defaults(func=cmd_build)
 
     test = sub.add_parser(
         "test",
         help="Fresh-build runner image, launch temporary test stack, and verify Docker build",
     )
-    test.add_argument("--tag", default=DEFAULT_IMAGE_TAG)
-    test.add_argument(
+    _ = test.add_argument("--tag", default=DEFAULT_IMAGE_TAG)
+    _ = test.add_argument(
         "--timeout",
         type=int,
         default=DEFAULT_TEST_TIMEOUT_SECONDS,
@@ -799,22 +794,22 @@ def build_parser() -> argparse.ArgumentParser:
         "start",
         help="Start docker:dind and forgejo-runner containers",
     )
-    start.add_argument("--tag", default=DEFAULT_IMAGE_TAG)
-    start.add_argument("--network-name", default=DEFAULT_NETWORK_NAME)
-    start.add_argument("--runner-name", default=DEFAULT_RUNNER_NAME)
-    start.add_argument("--dind-name", default=DEFAULT_DIND_NAME)
-    start.add_argument("--dind-volume", default=DEFAULT_DIND_VOLUME)
-    start.add_argument("--dind-port", type=int, default=DEFAULT_DIND_PORT)
-    start.add_argument("--runner-data-dir", default=DEFAULT_RUNNER_DATA_DIR)
-    start.add_argument("--timeout", type=int, default=DEFAULT_TEST_TIMEOUT_SECONDS)
+    _ = start.add_argument("--tag", default=DEFAULT_IMAGE_TAG)
+    _ = start.add_argument("--network-name", default=DEFAULT_NETWORK_NAME)
+    _ = start.add_argument("--runner-name", default=DEFAULT_RUNNER_NAME)
+    _ = start.add_argument("--dind-name", default=DEFAULT_DIND_NAME)
+    _ = start.add_argument("--dind-volume", default=DEFAULT_DIND_VOLUME)
+    _ = start.add_argument("--dind-port", type=int, default=DEFAULT_DIND_PORT)
+    _ = start.add_argument("--runner-data-dir", default=DEFAULT_RUNNER_DATA_DIR)
+    _ = start.add_argument("--timeout", type=int, default=DEFAULT_TEST_TIMEOUT_SECONDS)
     start.set_defaults(func=cmd_start)
 
     stop = sub.add_parser(
         "stop",
         help="Stop and remove docker:dind and forgejo-runner containers",
     )
-    stop.add_argument("--runner-name", default=DEFAULT_RUNNER_NAME)
-    stop.add_argument("--dind-name", default=DEFAULT_DIND_NAME)
+    _ = stop.add_argument("--runner-name", default=DEFAULT_RUNNER_NAME)
+    _ = stop.add_argument("--dind-name", default=DEFAULT_DIND_NAME)
     stop.set_defaults(func=cmd_stop)
 
     return parser
