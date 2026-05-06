@@ -20,6 +20,7 @@ DEFAULT_RUNNER_NAME = "forgejo-runner"
 DEFAULT_DIND_NAME = "docker-dind"
 DEFAULT_DIND_VOLUME = "forgejo-dind-data"
 DEFAULT_DIND_PORT = 2375
+DEFAULT_DIND_MEMORY = "4G"
 DEFAULT_RUNNER_DATA_DIR = "./runner-data"
 DEFAULT_RUNNER_CONFIG = "runner-config.yml"
 
@@ -222,6 +223,7 @@ def start_dind_container(
     network_name: str,
     dind_volume: str,
     dind_port: int,
+    dind_memory: str,
 ) -> None:
     common = [
         "container",
@@ -233,6 +235,8 @@ def start_dind_container(
         network_name,
         "-v",
         f"{dind_volume}:/var/lib/docker",
+        "--memory",
+        dind_memory,
     ]
 
     if dind_port > 0:
@@ -740,7 +744,9 @@ def cmd_test(args: TestArgs) -> int:
     _ = run(["container", "network", "create", network_name])
 
     try:
-        start_dind_container(dind_name, network_name, dind_volume, 0)
+        start_dind_container(
+            dind_name, network_name, dind_volume, 0, DEFAULT_DIND_MEMORY
+        )
         dind_host = get_container_ipv4(dind_name, network_name)
         wait_for_dind(dind_host, dind_name, network_name, args.timeout)
 
@@ -781,6 +787,7 @@ def cmd_start(args: StartArgs) -> int:
         network_name=args.network_name,
         dind_volume=args.dind_volume,
         dind_port=args.dind_port,
+        dind_memory=DEFAULT_DIND_MEMORY,
     )
 
     dind_host = get_container_ipv4(args.dind_name, args.network_name)
